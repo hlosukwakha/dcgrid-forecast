@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dcgrid-ingest
+  namespace: dcgrid
+spec:
+  schedule: "0 */6 * * *" # every 6 hours
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: ingest
+              image: dcgrid/worker:local
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: REGION
+                  value: "IE"
+                - name: EIRGRID_SYSTEM_DATA_URL
+                  value: "https://cms.eirgrid.ie/sites/default/files/publications/System-Data-Qtr-Hourly-2025-v11.xlsx"
+                - name: POSTGRES_HOST
+                  value: "postgres"
+                - name: POSTGRES_PORT
+                  value: "5432"
+                - name: POSTGRES_DB
+                  value: "dcgrid"
+                - name: POSTGRES_USER
+                  value: "dcgrid"
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: dcgrid-env
+                      key: POSTGRES_PASSWORD
+              command: ["python","-m","dcgrid.scripts.ingest"]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dcgrid-train
+  namespace: dcgrid
+spec:
+  schedule: "0 2 * * *" # daily
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: train
+              image: dcgrid/worker:local
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: REGION
+                  value: "IE"
+                - name: POSTGRES_HOST
+                  value: "postgres"
+                - name: POSTGRES_PORT
+                  value: "5432"
+                - name: POSTGRES_DB
+                  value: "dcgrid"
+                - name: POSTGRES_USER
+                  value: "dcgrid"
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: dcgrid-env
+                      key: POSTGRES_PASSWORD
+                - name: MINIO_ENDPOINT
+                  value: "http://minio:9000"
+                - name: MINIO_ACCESS_KEY
+                  value: "minioadmin"
+                - name: MINIO_SECRET_KEY
+                  value: "minioadmin"
+                - name: MINIO_BUCKET
+                  value: "dcgrid"
+                - name: MODEL_NAME
+                  value: "xgb"
+              command: ["python","-m","dcgrid.scripts.train"]

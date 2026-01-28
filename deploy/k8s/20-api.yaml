@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dcgrid-api
+  namespace: dcgrid
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: dcgrid-api}
+  template:
+    metadata:
+      labels: {app: dcgrid-api}
+    spec:
+      containers:
+        - name: api
+          image: dcgrid/api:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: REGION
+              value: "IE"
+            - name: POSTGRES_HOST
+              value: "postgres"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "dcgrid"
+            - name: POSTGRES_USER
+              value: "dcgrid"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dcgrid-env
+                  key: POSTGRES_PASSWORD
+            - name: MINIO_ENDPOINT
+              value: "http://minio:9000"
+            - name: MINIO_ACCESS_KEY
+              value: "minioadmin"
+            - name: MINIO_SECRET_KEY
+              value: "minioadmin"
+            - name: MINIO_BUCKET
+              value: "dcgrid"
+            - name: MODEL_NAME
+              value: "xgb"
+          ports:
+            - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dcgrid-api
+  namespace: dcgrid
+spec:
+  selector: {app: dcgrid-api}
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcgrid"
+version = "0.1.0"
+description = "Data-centre load growth forecasting + grid stress indicators (Ireland-first, extensible)"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["services"]

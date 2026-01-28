@@ -1,0 +1,136 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dcgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-dcgrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dcgrid}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  mlflow:
+    build:
+      context: ..
+      dockerfile: infra/mlflow/Dockerfile
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql+psycopg2://${POSTGRES_USER:-dcgrid}:${POSTGRES_PASSWORD:-dcgrid}@postgres:5432/${POSTGRES_DB:-dcgrid}
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: s3://${MINIO_BUCKET:-dcgrid}/mlflow
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MLFLOW_S3_ENDPOINT_URL: ${MINIO_ENDPOINT:-http://minio:9000}
+    ports:
+      - "5001:5000"
+    depends_on:
+      - postgres
+      - minio
+    command: >
+      bash -lc "mlflow server
+      --host 0.0.0.0 --port 5000
+      --backend-store-uri $$MLFLOW_BACKEND_STORE_URI
+      --default-artifact-root $$MLFLOW_DEFAULT_ARTIFACT_ROOT"
+
+
+  api:
+    build:
+      context: ..
+      dockerfile: services/dcgrid/api/Dockerfile
+    environment:
+      REGION: ${REGION:-IE}
+      EIRGRID_SYSTEM_DATA_URL: ${EIRGRID_SYSTEM_DATA_URL}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-dcgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-dcgrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dcgrid}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dcgrid}
+      MODEL_NAME: ${MODEL_NAME:-xgb}
+      FORECAST_HORIZON_H: ${FORECAST_HORIZON_H:-168}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - minio
+      - mlflow
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: services/dcgrid/dashboard/Dockerfile
+    environment:
+      REGION: ${REGION:-IE}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-dcgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-dcgrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dcgrid}
+    ports:
+      - "8501:8501"
+    depends_on:
+      - postgres
+    command: ["streamlit", "run", "services/dcgrid/dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+
+
+  ingest:
+    build:
+      context: ..
+      dockerfile: services/dcgrid/worker.Dockerfile
+    env_file:
+       - ../.env
+    environment:
+      REGION: ${REGION:-IE}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-dcgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-dcgrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dcgrid}
+    depends_on:
+      - postgres
+    command: ["python", "-m", "dcgrid.scripts.ingest"]
+
+  train:
+    build:
+      context: ..
+      dockerfile: services/dcgrid/worker.Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      REGION: ${REGION:-IE}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-dcgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-dcgrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dcgrid}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dcgrid}
+      MODEL_NAME: ${MODEL_NAME:-xgb}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      - postgres
+      - minio
+      - mlflow
+    command: ["python", "-m", "dcgrid.scripts.train"]
+    
+
+volumes:
+  pgdata: {}
+  miniodata: {}
