@@ -7,6 +7,7 @@ import sys
 import traceback
 import pickle
 from typing import Any, Dict, Optional
+import math
 
 import numpy as np
 import pandas as pd
@@ -212,7 +213,12 @@ def main() -> None:
             artifact = train_xgb(df)
 
         # log numeric metrics
-        mlflow.log_metrics({k: v for k, v in artifact.items() if isinstance(v, (int, float))})
+       
+        metrics = {}
+        for k, v in artifact.items():
+            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                metrics[k] = float(v)
+        mlflow.log_metrics(metrics)
 
         saved = _persist_artifact(artifact)
         mlflow.log_param("model_object_store", saved)

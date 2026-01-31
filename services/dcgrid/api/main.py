@@ -39,9 +39,22 @@ def _load_latest_features(n_hours: int = 24*30) -> pd.DataFrame:
     return df
 
 def _load_model() -> Dict[str, Any]:
-    key = f"models/{config.REGION}/{config.MODEL_NAME}.pkl"
-    blob = get_bytes(key)
+    if config.MODEL_NAME.lower() == "tft":
+        # Option B: TFT is saved as Lightning checkpoint + meta
+        ckpt_blob = get_bytes(config.MODEL_OBJECT_KEY)
+        meta_blob = get_bytes(config.MODEL_META_KEY)
+
+        # TODO: load ckpt into TFT model here (we’ll wire this after train writes meta correctly)
+        return {
+            "type": "tft",
+            "checkpoint_bytes": ckpt_blob,
+            "meta": json.loads(meta_blob),
+        }
+
+    # legacy models
+    blob = get_bytes(config.MODEL_OBJECT_KEY)
     return pickle.loads(blob)
+
 
 @app.get("/healthz")
 def healthz():

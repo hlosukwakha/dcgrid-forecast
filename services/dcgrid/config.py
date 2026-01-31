@@ -29,3 +29,19 @@ MINIO_BUCKET = env("MINIO_BUCKET", "dcgrid")
 MODEL_NAME = env("MODEL_NAME", "tft")  # tft | xgb | prophet
 FORECAST_HORIZON_H = int(env("FORECAST_HORIZON_H", "168"))      # 7 days
 CONTEXT_LENGTH_H = int(env("CONTEXT_LENGTH_H", "336"))         # 14 days
+
+# --- Model artifact keys in MinIO (Option B: TFT checkpoints, not pickle) ---
+
+MODEL_NAME_L = MODEL_NAME.lower()
+
+MODEL_OBJECT_KEY = os.getenv("MODEL_OBJECT_KEY") or (
+    f"models/{REGION}/tft.ckpt"
+    if MODEL_NAME_L == "tft"
+    else f"models/{REGION}/{MODEL_NAME}.pkl"
+)
+
+MODEL_META_KEY = os.getenv("MODEL_META_KEY") or (
+    f"models/{REGION}/tft.meta.json"
+    if MODEL_NAME_L == "tft"
+    else ""
+)

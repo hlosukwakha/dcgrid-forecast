@@ -201,12 +201,15 @@ def train_tft(df: pd.DataFrame) -> Dict[str, Any]:
     # Training + checkpoint
     # -----------------------
     ckpt_dir = os.getenv("TFT_CKPT_DIR", tempfile.gettempdir())
+
     ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename="tft-{epoch}-{val_loss:.2f}",
+        # safer filename (avoid formatting errors if metric missing at init)
+        filename="tft-{epoch}",
         monitor="val_loss",
         mode="min",
         save_last=True,
+        save_top_k=1,
     )
 
     trainer = Trainer(
@@ -228,51 +231,24 @@ def train_tft(df: pd.DataFrame) -> Dict[str, Any]:
     # -----------------------
     mae = float("nan")
     try:
-        out = tft.predict(val_loader, mode="raw", return_x=True)
+        # Prefer prediction mode + return_y when available (most stable)
+        try:
+            pred, y = tft.predict(val_loader, mode="prediction", return_y=True)
+        except TypeError:
+            # older versions: no return_y
+            pred = tft.predict(val_loader, mode="prediction")
+            y = None
 
-        raw_predictions = None
-        x = None
-        if isinstance(out, tuple):
-            raw_predictions = out[0]
-            x = out[1] if len(out) > 1 else None
-        elif hasattr(out, "output") and hasattr(out, "x"):
-            raw_predictions = out.output
-            x = out.x
-        else:
-            raw_predictions = out
+        if y is None:
+            raise RuntimeError("predict(return_y=True) not supported; MAE preview skipped")
 
-        pred_obj = raw_predictions
-        if isinstance(pred_obj, (list, tuple)) and len(pred_obj) > 0:
-            pred_obj = pred_obj[0]
+        pred_np = pred.detach().cpu().numpy() if hasattr(pred, "detach") else np.asarray(pred)
+        y_np = y.detach().cpu().numpy() if hasattr(y, "detach") else np.asarray(y)
 
-        if isinstance(pred_obj, dict) and "prediction" in pred_obj:
-            pred = pred_obj["prediction"]
-        elif hasattr(pred_obj, "prediction"):
-            pred = pred_obj.prediction
-        else:
-            raise RuntimeError(f"Unsupported raw prediction type: {type(pred_obj)}")
-
-        if x is None:
-            raise RuntimeError("return_x did not return x")
-        if isinstance(x, dict) and "decoder_target" in x:
-            ytrue_t = x["decoder_target"]
-        elif hasattr(x, "decoder_target"):
-            ytrue_t = x.decoder_target
-        else:
-            raise RuntimeError(f"Unsupported x type: {type(x)}")
-
-        pred_np = pred.detach().cpu().numpy()
-        ytrue_np = ytrue_t.detach().cpu().numpy()
-
-        if pred_np.ndim == 3 and pred_np.shape[-1] >= 2:
-            yhat = pred_np[:, :, 1]  # median quantile
-        else:
-            yhat = pred_np[..., 0]
-
-        mae = float(np.mean(np.abs(ytrue_np - yhat)))
+        mae = float(np.mean(np.abs(y_np - pred_np)))
 
     except Exception as e:
-        print(f"WARN: TFT predict/MAE preview failed (continuing anyway): {e}")
+        print(f"WARN: TFT MAE preview failed (continuing anyway): {e}")
 
     # IMPORTANT: return NO model object
     return {
@@ -288,5 +264,7 @@ def train_tft(df: pd.DataFrame) -> Dict[str, Any]:
             "known_categoricals": known_categoricals,
             "unknown_reals": unknown_reals,
             "min_non_na_frac": min_non_na_frac,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
         },
     }
