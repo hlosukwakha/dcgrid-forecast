@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dcgrid-train
+  namespace: dcgrid
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -lc
+            - |
+              echo "Waiting for postgres...";
+              until pg_isready -h postgres -p 5432; do sleep 2; done
+              echo "Postgres is ready."
+        - name: wait-minio
+          image: curlimages/curl:8.7.1
+          command:
+            - sh
+            - -lc
+            - |
+              echo "Waiting for minio...";
+              until curl -sf http://minio:9000/minio/health/ready; do sleep 2; done
+              echo "Minio is ready."
+        - name: wait-mlflow
+          image: curlimages/curl:8.7.1
+          command:
+            - sh
+            - -lc
+            - |
+              echo "Waiting for mlflow...";
+              until curl -sf http://mlflow:5000/; do sleep 2; done
+              echo "Mlflow is ready."
+      containers:
+        - name: train
+          image: dcgrid/worker:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "dcgrid.scripts.train"]
+          env:
+            - name: REGION
+              value: "IE"
+            - name: MODEL_NAME
+              value: "tft"
+            - name: FORECAST_HORIZON_H
+              value: "168"
+
+            - name: POSTGRES_HOST
+              value: "postgres"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "dcgrid"
+            - name: POSTGRES_USER
+              value: "dcgrid"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dcgrid-env
+                  key: POSTGRES_PASSWORD
+
+            - name: MINIO_ENDPOINT
+              value: "http://minio:9000"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dcgrid-env
+                  key: MINIO_ACCESS_KEY
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dcgrid-env
+                  key: MINIO_SECRET_KEY
+            - name: MINIO_BUCKET
+              value: "dcgrid"
+
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow:5000"

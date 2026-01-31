@@ -16,9 +16,9 @@ pydantic>=2.6
 streamlit>=1.33
 
 # Deep learning (optional but recommended)
-torch>=2.2
-pytorch-lightning>=2.2
-pytorch-forecasting>=1.0
+torch>=2.2.2
+lightning>=2.2.5
+pytorch-forecasting>=1.0.0
 
 # Prophet baseline (optional)
 prophet>=1.1

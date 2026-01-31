@@ -2,8 +2,11 @@ __pycache__/
 *.pyc
 .venv/
 .env
+.envrc
+env.k3s
 data/
 artifacts/
 mlruns/
 .DS_Store
 .dcgrid/
+infra/k3s/manifests/generated/

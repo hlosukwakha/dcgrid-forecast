@@ -6,17 +6,19 @@ import pandas as pd
 
 def train_tft(df: pd.DataFrame) -> dict:
     """
-    Minimal, reproducible TFT training using PyTorch Forecasting.
+    Robust TFT training for messy real-world feature tables.
 
-    Key robustness points:
-      - Cast categorical covariates to string (PyTorch Forecasting requires non-numeric dtype for categoricals).
-      - Ensure all real-valued covariates are numeric (coerce errors to NaN).
-      - Handle missing/empty dc_load_mw gracefully by falling back to demand_mw as a proxy target.
-      - Drop rows with missing timestamps/targets and enforce sorted time.
+    Key points:
+      - PyTorch Forecasting does NOT allow NA/inf values in real-valued covariates.
+      - We therefore:
+          1) auto-drop covariates that are all-NA (or mostly NA),
+          2) replace inf -> NaN,
+          3) fill remaining NaNs (0) and add *_isna indicator columns.
+      - Categorical covariates must be non-numeric dtype -> cast to string.
+      - Target uses dc_load_mw if present, otherwise falls back to demand_mw.
     """
     try:
-        import torch  # noqa: F401
-        from pytorch_lightning import Trainer
+        from lightning.pytorch import Trainer
         from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
         from pytorch_forecasting.data import GroupNormalizer
         from pytorch_forecasting.metrics import QuantileLoss
@@ -28,30 +30,29 @@ def train_tft(df: pd.DataFrame) -> dict:
 
     data = df.copy()
 
-    # --- Ensure timestamp column exists and is datetime (UTC) ---
+    # --- Timestamp ---
     if "ts_utc" in data.columns:
         ts_col = "ts_utc"
     elif isinstance(data.index, pd.DatetimeIndex):
         data = data.reset_index().rename(columns={"index": "ts_utc"})
         ts_col = "ts_utc"
     else:
-        # best-effort fallback: take first column as time
         ts_col = data.columns[0]
 
     data = data.rename(columns={ts_col: "time"})
     data["time"] = pd.to_datetime(data["time"], utc=True, errors="coerce")
     data = data.dropna(subset=["time"]).sort_values("time")
 
-    # --- Create time index in hours ---
+    # --- time_idx in hours ---
     data["time_idx"] = ((data["time"] - data["time"].min()).dt.total_seconds() // 3600).astype(int)
 
-    # Single series demo; for multi-series use region or other IDs
+    # --- group id ---
     if "region" in data.columns:
         data["series"] = data["region"].astype(str)
     else:
         data["series"] = "dcgrid"
 
-    # --- Target: prefer dc_load_mw; fallback to demand_mw if dc_load_mw is empty ---
+    # --- target ---
     if "dc_load_mw" in data.columns:
         data["dc_load_mw"] = pd.to_numeric(data["dc_load_mw"], errors="coerce")
     else:
@@ -62,22 +63,21 @@ def train_tft(df: pd.DataFrame) -> dict:
         target_note = "dc_load_mw"
     else:
         if "demand_mw" not in data.columns:
-            raise RuntimeError(
-                "No usable target: dc_load_mw is empty/missing and demand_mw not present."
-            )
+            raise RuntimeError("No usable target: dc_load_mw missing and demand_mw not present.")
         data["demand_mw"] = pd.to_numeric(data["demand_mw"], errors="coerce")
         data["y"] = data["demand_mw"]
         target_note = "demand_mw_fallback"
 
     data = data.dropna(subset=["y"])
 
-    # --- Known covariates: calendar features (categorical) ---
+    # --- known categoricals (cast to string as required) ---
     data["hour"] = data["time"].dt.hour.astype("Int64").astype(str)
     data["dow"] = data["time"].dt.dayofweek.astype("Int64").astype(str)
     data["month"] = data["time"].dt.month.astype("Int64").astype(str)
 
-    # --- Unknown reals (observed at prediction time only historically) ---
-    # Keep only columns that exist; coerce to numeric for model stability.
+    known_categoricals = ["hour", "dow", "month"]
+
+    # --- candidate unknown reals ---
     candidate_unknown_reals = [
         "y",
         "demand_mw",
@@ -89,26 +89,53 @@ def train_tft(df: pd.DataFrame) -> dict:
         "renew_var_24h",
         "stress_score",
     ]
-    time_varying_unknown_reals: list[str] = []
+
+    # Make sure all numeric columns are numeric, and replace inf -> NaN
     for c in candidate_unknown_reals:
         if c in data.columns:
             data[c] = pd.to_numeric(data[c], errors="coerce")
-            time_varying_unknown_reals.append(c)
+            data[c] = data[c].replace([np.inf, -np.inf], np.nan)
 
-    # Remove rows that are completely unusable (all unknown reals NaN besides y already dropped)
-    if "y" not in time_varying_unknown_reals:
-        time_varying_unknown_reals = ["y"] + time_varying_unknown_reals
+    # Drop features that are all-NA (or too sparse)
+    # With optional signals (prices/DC), this prevents TFT from crashing.
+    min_non_na_frac = 0.20  # keep if at least 20% values present
+    unknown_reals: list[str] = ["y"]
+
+    dropped: list[tuple[str, float]] = []
+    kept: list[tuple[str, float]] = []
+
+    for c in candidate_unknown_reals:
+        if c == "y":
+            continue
+        if c not in data.columns:
+            continue
+        frac = float(data[c].notna().mean())
+        if frac <= 0.0 or frac < min_non_na_frac:
+            dropped.append((c, frac))
+            continue
+        kept.append((c, frac))
+        unknown_reals.append(c)
+
+    # For remaining unknown reals, fill missing values + add missing indicators
+    # (PyTorch Forecasting requires finite values for reals).
+    fill_cols = [c for c in unknown_reals if c != "y"]
+    for c in fill_cols:
+        ind = f"{c}_isna"
+        data[ind] = data[c].isna().astype("float")
+        data[c] = data[c].fillna(0.0)
+
+    # Add the indicator columns as additional unknown reals
+    for c in fill_cols:
+        unknown_reals.append(f"{c}_isna")
 
     # --- Dataset lengths ---
-    max_encoder_length = 336  # 14 days
-    max_prediction_length = 168  # 7 days
+    max_encoder_length = 336  # 14d
+    max_prediction_length = 168  # 7d
 
-    # Need enough history for at least one prediction window
     if data["time_idx"].max() < (max_encoder_length + max_prediction_length + 1):
         raise RuntimeError(
             "Not enough data to train TFT: "
-            f"need at least ~{max_encoder_length + max_prediction_length + 1} hourly rows, "
-            f"got {int(data['time_idx'].max()) + 1}."
+            f"need at least ~{max_encoder_length + max_prediction_length + 1} hourly rows."
         )
 
     training_cutoff = data["time_idx"].max() - max_prediction_length
@@ -121,8 +148,8 @@ def train_tft(df: pd.DataFrame) -> dict:
         max_encoder_length=max_encoder_length,
         max_prediction_length=max_prediction_length,
         static_categoricals=["series"],
-        time_varying_known_categoricals=["hour", "dow", "month"],
-        time_varying_unknown_reals=time_varying_unknown_reals,
+        time_varying_known_categoricals=known_categoricals,
+        time_varying_unknown_reals=unknown_reals,
         target_normalizer=GroupNormalizer(groups=["series"]),
         add_relative_time_idx=True,
         add_target_scales=True,
@@ -155,10 +182,8 @@ def train_tft(df: pd.DataFrame) -> dict:
     )
     trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    # Metric: MAE using quantile 0.5 on the prediction window
     raw_predictions, x = tft.predict(val_loader, mode="raw", return_x=True)
-    # QuantileLoss default quantiles include 0.1, 0.5, 0.9 -> index 1 is median
-    yhat = raw_predictions["prediction"][:, :, 1].detach().cpu().numpy()
+    yhat = raw_predictions["prediction"][:, :, 1].detach().cpu().numpy()  # median
     ytrue = x["decoder_target"].detach().cpu().numpy()
     mae = float(np.mean(np.abs(ytrue - yhat)))
 
@@ -167,10 +192,13 @@ def train_tft(df: pd.DataFrame) -> dict:
         "mae_val": mae,
         "model": tft,
         "target_used": target_note,
+        "dropped_features": [{"name": n, "non_na_frac": f} for n, f in dropped],
+        "kept_features": [{"name": n, "non_na_frac": f} for n, f in kept],
         "dataset_meta": {
             "max_encoder_length": max_encoder_length,
             "max_prediction_length": max_prediction_length,
-            "known_categoricals": ["hour", "dow", "month"],
-            "unknown_reals": time_varying_unknown_reals,
+            "known_categoricals": known_categoricals,
+            "unknown_reals": unknown_reals,
+            "min_non_na_frac": min_non_na_frac,
         },
     }

@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dcgrid-ingest
+  namespace: dcgrid
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: dcgrid-ingest
+    spec:
+      restartPolicy: Never
+
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_HOST
+              value: "postgres"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              valueFrom: { secretKeyRef: { name: dcgrid-env, key: POSTGRES_DB } }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: dcgrid-env, key: POSTGRES_USER } }
+          command:
+            - sh
+            - -lc
+            - |
+              set -e
+              echo "Waiting for DNS for ${POSTGRES_HOST}..."
+              until getent hosts "${POSTGRES_HOST}" >/dev/null 2>&1; do
+                sleep 1
+              done
+              echo "Waiting for Postgres to accept connections..."
+              until pg_isready -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"; do
+                sleep 2
+              done
+              echo "Postgres is ready."
+
+      containers:
+        - name: ingest
+          image: dcgrid/worker:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "dcgrid.scripts.ingest"]
+          env:
+            - name: REGION
+              value: "IE"
+
+            - name: POSTGRES_HOST
+              value: "postgres"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              valueFrom: { secretKeyRef: { name: dcgrid-env, key: POSTGRES_DB } }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: dcgrid-env, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: dcgrid-env, key: POSTGRES_PASSWORD } }
+
+            - name: MINIO_ENDPOINT
+              value: "http://minio:9000"
+            - name: MINIO_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: dcgrid-env, key: MINIO_ACCESS_KEY } }
+            - name: MINIO_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: dcgrid-env, key: MINIO_SECRET_KEY } }
+            - name: MINIO_BUCKET
+              value: "dcgrid"
+
+            - name: EIRGRID_SYSTEM_DATA_URL
+              value: "https://cms.eirgrid.ie/sites/default/files/publications/System-Data-Qtr-Hourly-2025-v11.xlsx"

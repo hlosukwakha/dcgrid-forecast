@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: dcgrid
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+        - name: mlflow
+          image: dcgrid/mlflow:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+          env:
+            - name: MLFLOW_BACKEND_STORE_URI
+              value: "postgresql+psycopg2://dcgrid:dcgrid@postgres:5432/dcgrid"
+            - name: MLFLOW_DEFAULT_ARTIFACT_ROOT
+              value: "s3://dcgrid/mlflow"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: dcgrid-env
+                  key: MINIO_ACCESS_KEY
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dcgrid-env
+                  key: MINIO_SECRET_KEY
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: "http://minio:9000"
+
+          command: ["bash","-lc"]
+          args:
+            - >
+              mlflow server
+              --host 0.0.0.0 --port 5000
+              --backend-store-uri "${MLFLOW_BACKEND_STORE_URI}"
+              --default-artifact-root "${MLFLOW_DEFAULT_ARTIFACT_ROOT}"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: dcgrid
+spec:
+  selector:
+    app: mlflow
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+  type: ClusterIP

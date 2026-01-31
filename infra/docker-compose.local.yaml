@@ -124,6 +124,7 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-dcgrid}
       MODEL_NAME: ${MODEL_NAME:-xgb}
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      DATALOADER_WORKERS: "4"
     depends_on:
       - postgres
       - minio
