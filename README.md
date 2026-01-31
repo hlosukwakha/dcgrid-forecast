@@ -13,7 +13,7 @@
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-k3s-326CE5?logo=kubernetes&logoColor=white)](https://k3s.io/)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.x-D71F00)](https://www.sqlalchemy.org/)
 
-![image](image.png)
+![image](./train.png)
 
 Forecast **data-centre load** and **grid stress** (Ireland-first) using public grid/market data, store features in Postgres, track experiments in MLflow, persist model artifacts to MinIO (S3), expose predictions via FastAPI, and explore results in a Streamlit dashboard.
 
