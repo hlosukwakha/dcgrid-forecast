@@ -5,6 +5,7 @@ metadata:
   namespace: dcgrid
 spec:
   backoffLimit: 0
+  ttlSecondsAfterFinished: 3600   # keep pod/logs for 1 hour after completion/failure
   template:
     spec:
       restartPolicy: Never
@@ -48,6 +49,8 @@ spec:
               value: "tft"
             - name: FORECAST_HORIZON_H
               value: "168"
+            - name: PYTHONUNBUFFERED
+              value: "1"
 
             - name: POSTGRES_HOST
               value: "postgres"

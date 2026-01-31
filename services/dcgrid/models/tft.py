@@ -1,36 +1,45 @@
 from __future__ import annotations
 
+import os
+import tempfile
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 
 
-def train_tft(df: pd.DataFrame) -> dict:
+def train_tft(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Robust TFT training for messy real-world feature tables.
 
+    Returns ONLY serializable metadata + a checkpoint_path (no model object),
+    so callers can persist the checkpoint bytes (MinIO) and avoid pickle issues.
+
     Key points:
-      - PyTorch Forecasting does NOT allow NA/inf values in real-valued covariates.
-      - We therefore:
-          1) auto-drop covariates that are all-NA (or mostly NA),
-          2) replace inf -> NaN,
-          3) fill remaining NaNs (0) and add *_isna indicator columns.
-      - Categorical covariates must be non-numeric dtype -> cast to string.
-      - Target uses dc_load_mw if present, otherwise falls back to demand_mw.
+      - PyTorch Forecasting does NOT allow NA/inf values in real covariates.
+      - We:
+          1) replace inf -> NaN,
+          2) drop very sparse covariates,
+          3) fill remaining NaNs (0) and add *_isna indicator columns,
+          4) cast known categoricals to strings.
     """
     try:
         from lightning.pytorch import Trainer
+        from lightning.pytorch.callbacks import ModelCheckpoint
         from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
         from pytorch_forecasting.data import GroupNormalizer
         from pytorch_forecasting.metrics import QuantileLoss
     except Exception as e:
         raise RuntimeError(
-            "TFT deps missing. Install torch, pytorch-lightning and pytorch-forecasting, "
+            "TFT deps missing. Install torch, lightning and pytorch-forecasting, "
             "or set MODEL_NAME=xgb."
         ) from e
 
     data = df.copy()
 
-    # --- Timestamp ---
+    # -----------------------
+    # Timestamp normalization
+    # -----------------------
     if "ts_utc" in data.columns:
         ts_col = "ts_utc"
     elif isinstance(data.index, pd.DatetimeIndex):
@@ -43,16 +52,22 @@ def train_tft(df: pd.DataFrame) -> dict:
     data["time"] = pd.to_datetime(data["time"], utc=True, errors="coerce")
     data = data.dropna(subset=["time"]).sort_values("time")
 
-    # --- time_idx in hours ---
-    data["time_idx"] = ((data["time"] - data["time"].min()).dt.total_seconds() // 3600).astype(int)
+    # time_idx in hours since start
+    data["time_idx"] = (
+        (data["time"] - data["time"].min()).dt.total_seconds() // 3600
+    ).astype(int)
 
-    # --- group id ---
+    # -----------------------
+    # Group id
+    # -----------------------
     if "region" in data.columns:
         data["series"] = data["region"].astype(str)
     else:
         data["series"] = "dcgrid"
 
-    # --- target ---
+    # -----------------------
+    # Target selection
+    # -----------------------
     if "dc_load_mw" in data.columns:
         data["dc_load_mw"] = pd.to_numeric(data["dc_load_mw"], errors="coerce")
     else:
@@ -69,16 +84,21 @@ def train_tft(df: pd.DataFrame) -> dict:
         target_note = "demand_mw_fallback"
 
     data = data.dropna(subset=["y"])
+    if data.empty:
+        raise RuntimeError("No training rows after target selection (all targets are NA).")
 
-    # --- known categoricals (cast to string as required) ---
+    # -----------------------
+    # Known categoricals (string)
+    # -----------------------
     data["hour"] = data["time"].dt.hour.astype("Int64").astype(str)
     data["dow"] = data["time"].dt.dayofweek.astype("Int64").astype(str)
     data["month"] = data["time"].dt.month.astype("Int64").astype(str)
+    known_categoricals: List[str] = ["hour", "dow", "month"]
 
-    known_categoricals = ["hour", "dow", "month"]
-
-    # --- candidate unknown reals ---
-    candidate_unknown_reals = [
+    # -----------------------
+    # Candidate unknown reals
+    # -----------------------
+    candidate_unknown_reals: List[str] = [
         "y",
         "demand_mw",
         "wind_mw",
@@ -90,55 +110,52 @@ def train_tft(df: pd.DataFrame) -> dict:
         "stress_score",
     ]
 
-    # Make sure all numeric columns are numeric, and replace inf -> NaN
+    # Coerce numeric and replace inf
     for c in candidate_unknown_reals:
         if c in data.columns:
             data[c] = pd.to_numeric(data[c], errors="coerce")
             data[c] = data[c].replace([np.inf, -np.inf], np.nan)
 
-    # Drop features that are all-NA (or too sparse)
-    # With optional signals (prices/DC), this prevents TFT from crashing.
-    min_non_na_frac = 0.20  # keep if at least 20% values present
-    unknown_reals: list[str] = ["y"]
+    # Drop sparse signals
+    min_non_na_frac = float(os.getenv("TFT_MIN_NON_NA_FRAC", "0.20"))
+    unknown_reals: List[str] = ["y"]
 
-    dropped: list[tuple[str, float]] = []
-    kept: list[tuple[str, float]] = []
+    dropped: List[Tuple[str, float]] = []
+    kept: List[Tuple[str, float]] = []
 
     for c in candidate_unknown_reals:
-        if c == "y":
-            continue
-        if c not in data.columns:
+        if c == "y" or c not in data.columns:
             continue
         frac = float(data[c].notna().mean())
-        if frac <= 0.0 or frac < min_non_na_frac:
+        if frac < min_non_na_frac:
             dropped.append((c, frac))
             continue
         kept.append((c, frac))
         unknown_reals.append(c)
 
-    # For remaining unknown reals, fill missing values + add missing indicators
-    # (PyTorch Forecasting requires finite values for reals).
+    # Fill remaining NA for reals + indicators
     fill_cols = [c for c in unknown_reals if c != "y"]
     for c in fill_cols:
         ind = f"{c}_isna"
-        data[ind] = data[c].isna().astype("float")
+        data[ind] = data[c].isna().astype("float32")
         data[c] = data[c].fillna(0.0)
 
-    # Add the indicator columns as additional unknown reals
     for c in fill_cols:
         unknown_reals.append(f"{c}_isna")
 
-    # --- Dataset lengths ---
-    max_encoder_length = 336  # 14d
-    max_prediction_length = 168  # 7d
+    # -----------------------
+    # Dataset lengths
+    # -----------------------
+    max_encoder_length = int(os.getenv("TFT_ENCODER_LEN", "336"))  # 14d
+    max_prediction_length = int(os.getenv("TFT_PRED_LEN", "168"))  # 7d
 
-    if data["time_idx"].max() < (max_encoder_length + max_prediction_length + 1):
+    if int(data["time_idx"].max()) < (max_encoder_length + max_prediction_length + 1):
         raise RuntimeError(
             "Not enough data to train TFT: "
             f"need at least ~{max_encoder_length + max_prediction_length + 1} hourly rows."
         )
 
-    training_cutoff = data["time_idx"].max() - max_prediction_length
+    training_cutoff = int(data["time_idx"].max()) - max_prediction_length
 
     training = TimeSeriesDataSet(
         data[data["time_idx"] <= training_cutoff],
@@ -159,38 +176,109 @@ def train_tft(df: pd.DataFrame) -> dict:
 
     validation = TimeSeriesDataSet.from_dataset(training, data, predict=True, stop_randomization=True)
 
-    train_loader = training.to_dataloader(train=True, batch_size=64, num_workers=0)
-    val_loader = validation.to_dataloader(train=False, batch_size=64, num_workers=0)
+    num_workers = int(os.getenv("DATALOADER_WORKERS", "2"))
+    batch_size = int(os.getenv("TFT_BATCH_SIZE", "64"))
 
+    train_loader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=num_workers)
+    val_loader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=num_workers)
+
+    # -----------------------
+    # Model
+    # -----------------------
     tft = TemporalFusionTransformer.from_dataset(
         training,
-        learning_rate=1e-3,
-        hidden_size=16,
-        attention_head_size=2,
-        dropout=0.1,
-        hidden_continuous_size=8,
+        learning_rate=float(os.getenv("TFT_LR", "1e-3")),
+        hidden_size=int(os.getenv("TFT_HIDDEN_SIZE", "16")),
+        attention_head_size=int(os.getenv("TFT_ATTENTION_HEADS", "2")),
+        dropout=float(os.getenv("TFT_DROPOUT", "0.1")),
+        hidden_continuous_size=int(os.getenv("TFT_HIDDEN_CONT_SIZE", "8")),
         loss=QuantileLoss(),
         log_interval=10,
         reduce_on_plateau_patience=4,
     )
 
+    # -----------------------
+    # Training + checkpoint
+    # -----------------------
+    ckpt_dir = os.getenv("TFT_CKPT_DIR", tempfile.gettempdir())
+    ckpt_cb = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="tft-{epoch}-{val_loss:.2f}",
+        monitor="val_loss",
+        mode="min",
+        save_last=True,
+    )
+
     trainer = Trainer(
-        max_epochs=8,
+        max_epochs=int(os.getenv("TFT_MAX_EPOCHS", "8")),
         accelerator="cpu",
-        enable_checkpointing=False,
+        callbacks=[ckpt_cb],
         logger=False,
+        enable_checkpointing=True,
     )
     trainer.fit(tft, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    raw_predictions, x = tft.predict(val_loader, mode="raw", return_x=True)
-    yhat = raw_predictions["prediction"][:, :, 1].detach().cpu().numpy()  # median
-    ytrue = x["decoder_target"].detach().cpu().numpy()
-    mae = float(np.mean(np.abs(ytrue - yhat)))
+    checkpoint_path = ckpt_cb.best_model_path or ckpt_cb.last_model_path
+    if not checkpoint_path:
+        checkpoint_path = os.path.join(ckpt_dir, "tft-last.ckpt")
+        trainer.save_checkpoint(checkpoint_path)
 
+    # -----------------------
+    # Optional MAE preview (never fail job)
+    # -----------------------
+    mae = float("nan")
+    try:
+        out = tft.predict(val_loader, mode="raw", return_x=True)
+
+        raw_predictions = None
+        x = None
+        if isinstance(out, tuple):
+            raw_predictions = out[0]
+            x = out[1] if len(out) > 1 else None
+        elif hasattr(out, "output") and hasattr(out, "x"):
+            raw_predictions = out.output
+            x = out.x
+        else:
+            raw_predictions = out
+
+        pred_obj = raw_predictions
+        if isinstance(pred_obj, (list, tuple)) and len(pred_obj) > 0:
+            pred_obj = pred_obj[0]
+
+        if isinstance(pred_obj, dict) and "prediction" in pred_obj:
+            pred = pred_obj["prediction"]
+        elif hasattr(pred_obj, "prediction"):
+            pred = pred_obj.prediction
+        else:
+            raise RuntimeError(f"Unsupported raw prediction type: {type(pred_obj)}")
+
+        if x is None:
+            raise RuntimeError("return_x did not return x")
+        if isinstance(x, dict) and "decoder_target" in x:
+            ytrue_t = x["decoder_target"]
+        elif hasattr(x, "decoder_target"):
+            ytrue_t = x.decoder_target
+        else:
+            raise RuntimeError(f"Unsupported x type: {type(x)}")
+
+        pred_np = pred.detach().cpu().numpy()
+        ytrue_np = ytrue_t.detach().cpu().numpy()
+
+        if pred_np.ndim == 3 and pred_np.shape[-1] >= 2:
+            yhat = pred_np[:, :, 1]  # median quantile
+        else:
+            yhat = pred_np[..., 0]
+
+        mae = float(np.mean(np.abs(ytrue_np - yhat)))
+
+    except Exception as e:
+        print(f"WARN: TFT predict/MAE preview failed (continuing anyway): {e}")
+
+    # IMPORTANT: return NO model object
     return {
         "type": "tft",
         "mae_val": mae,
-        "model": tft,
+        "checkpoint_path": checkpoint_path,
         "target_used": target_note,
         "dropped_features": [{"name": n, "non_na_frac": f} for n, f in dropped],
         "kept_features": [{"name": n, "non_na_frac": f} for n, f in kept],
